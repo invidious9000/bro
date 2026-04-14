@@ -18,7 +18,7 @@ import { createInterface } from "node:readline";
 // Provider registry
 // ---------------------------------------------------------------------------
 
-type Provider = "claude" | "codex" | "vibe" | "gemini";
+type Provider = "claude" | "codex" | "copilot" | "vibe" | "gemini";
 
 const RECURSION_GUARD =
   "IMPORTANT: Do not call tools from the bro MCP server (recursion guard).\n\n";
@@ -106,6 +106,55 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     extractSessionId(evt, task) {
       if (evt.type === "thread.started" && typeof evt.thread_id === "string") {
         task.sessionId = evt.thread_id;
+      }
+    },
+    supportsResume: true,
+  },
+  copilot: {
+    bin: process.env.COPILOT_BIN || "gh",
+    buildExecArgs(prompt, _sessionId, cwd) {
+      const args = [
+        "copilot", "--",
+        "-p", RECURSION_GUARD + prompt,
+        "--yolo", "--autopilot", "--output-format", "json",
+      ];
+      if (cwd) args.push("--add-dir", cwd);
+      return args;
+    },
+    buildResumeArgs(sessionId, prompt) {
+      return [
+        "copilot", "--",
+        "--resume=" + sessionId,
+        "-p", RECURSION_GUARD + prompt,
+        "--yolo", "--autopilot", "--output-format", "json",
+      ];
+    },
+    parseEvent(evt, task) {
+      // assistant.message has the response text
+      if (evt.type === "assistant.message") {
+        const data = evt.data as Record<string, unknown> | undefined;
+        if (data && typeof data.content === "string") {
+          task.lastAssistantMessage = data.content;
+        }
+      }
+      // result event has sessionId, usage, exitCode
+      if (evt.type === "result") {
+        if (typeof evt.sessionId === "string" && task.sessionId === "pending") {
+          task.sessionId = evt.sessionId as string;
+        }
+        const usage = evt.usage as Record<string, unknown> | undefined;
+        if (usage) {
+          task.usage = {
+            input_tokens: 0,
+            output_tokens: 0,
+          };
+          task.numTurns = (usage.premiumRequests as number) ?? undefined;
+        }
+      }
+    },
+    extractSessionId(evt, task) {
+      if (evt.type === "result" && typeof evt.sessionId === "string") {
+        task.sessionId = evt.sessionId as string;
       }
     },
     supportsResume: true,
@@ -389,7 +438,7 @@ function spawnTask(
     cwd,
   };
 
-  const isStreamingJson = provider === "claude" || provider === "codex";
+  const isStreamingJson = provider === "claude" || provider === "codex" || provider === "copilot";
   let rawStdout = "";
 
   if (isStreamingJson) {
@@ -566,7 +615,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         "Resume a previous agent session. Sends a follow-up prompt into the " +
         "same conversation. Returns a new taskId on the same sessionId. " +
         "Use wait to block until the task completes. " +
-        "Supported by: claude, codex, vibe, gemini.",
+        "Supported by: claude, codex, copilot, vibe, gemini.",
       inputSchema: {
         type: "object" as const,
         properties: {

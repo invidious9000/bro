@@ -2,7 +2,7 @@
 
 Unified async MCP server for multi-provider agent orchestration.
 
-Launch Claude, Codex, Vibe (Devstral), or Gemini as background agents through a single MCP interface. The `exec`/`wait` pattern solves the MCP timeout problem — `exec` returns immediately, `wait` blocks until the agent finishes.
+Launch Claude, Codex, GitHub Copilot, Vibe (Devstral), or Gemini as background agents through a single MCP interface. The `exec`/`wait` pattern solves the MCP timeout problem — `exec` returns immediately, `wait` blocks until the agent finishes.
 
 ## Install
 
@@ -85,6 +85,7 @@ wait(taskId)                        -> {result, ...}
 |----------|--------|--------|-------------------|
 | `claude` | `claude` | Yes | Pre-assigned UUID |
 | `codex` | `codex` | Yes | From `thread.started` event |
+| `copilot` | `gh copilot` | Yes | From `result` event `sessionId` field |
 | `vibe` | `vibe` | Yes | Post-hoc from `~/.vibe/logs/session/` |
 | `gemini` | `gemini` | Yes | From JSON output `session_id` field |
 
@@ -94,6 +95,7 @@ wait(taskId)                        -> {result, ...}
 |----------|---------|-------------|
 | `CLAUDE_BIN` | `claude` | Path to Claude Code CLI |
 | `CODEX_BIN` | `codex` | Path to Codex CLI |
+| `COPILOT_BIN` | `gh` | Path to GitHub CLI (copilot runs via `gh copilot`) |
 | `VIBE_BIN` | `vibe` | Path to Vibe CLI |
 | `GEMINI_BIN` | `gemini` | Path to Gemini CLI |
 | `BRO_STORE` | `~/.bro` | Task persistence directory |

@@ -12,7 +12,7 @@
     "start": "tsx server.ts",
     "lint": "tsc --noEmit"
   },
-  "keywords": ["mcp", "agent", "claude", "codex", "vibe", "gemini", "async"],
+  "keywords": ["mcp", "agent", "claude", "codex", "copilot", "vibe", "gemini", "async"],
   "license": "MIT",
   "repository": {
     "type": "git",
