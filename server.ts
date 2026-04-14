@@ -130,14 +130,21 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       ];
     },
     parseEvent(evt, task) {
-      // assistant.message has the response text
+      // assistant.message — direct text responses
       if (evt.type === "assistant.message") {
         const data = evt.data as Record<string, unknown> | undefined;
         if (data && typeof data.content === "string") {
           task.lastAssistantMessage = data.content;
         }
       }
-      // result event has sessionId, usage, exitCode
+      // session.task_complete — autopilot mode completion summary
+      if (evt.type === "session.task_complete") {
+        const data = evt.data as Record<string, unknown> | undefined;
+        if (data && typeof data.summary === "string") {
+          task.lastAssistantMessage = data.summary;
+        }
+      }
+      // result event has sessionId, usage
       if (evt.type === "result") {
         if (typeof evt.sessionId === "string" && task.sessionId === "pending") {
           task.sessionId = evt.sessionId as string;
