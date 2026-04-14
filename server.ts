@@ -197,12 +197,12 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   gemini: {
     bin: process.env.GEMINI_BIN || "gemini",
     buildExecArgs(prompt) {
-      return ["-p", prompt, "--sandbox", "--yolo", "-o", "json"];
+      return ["-p", prompt, "--yolo", "-o", "json"];
     },
     buildResumeArgs(sessionId, prompt) {
       return [
         "--resume", sessionId,
-        "-p", prompt, "--sandbox", "--yolo", "-o", "json",
+        "-p", prompt, "--yolo", "-o", "json",
       ];
     },
     parseEvent(evt, task) {
