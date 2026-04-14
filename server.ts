@@ -593,8 +593,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "exec",
       description:
-        "Launch an agent task. Returns {taskId, sessionId} immediately. " +
-        "Use wait to block until the task completes. " +
+        "Launch an agent task. Returns {taskId, sessionId} immediately — " +
+        "the agent runs in the background. If you have other work to do, " +
+        "do it now and call wait later. If you have no other work, or the " +
+        "user asks you to wait, call wait immediately. " +
         `Providers: ${VALID_PROVIDERS.join(", ")}.`,
       inputSchema: {
         type: "object" as const,
@@ -621,7 +623,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Resume a previous agent session. Sends a follow-up prompt into the " +
         "same conversation. Returns a new taskId on the same sessionId. " +
-        "Use wait to block until the task completes. " +
+        "Same rules as exec — do other work first, call wait when ready. " +
         "Supported by: claude, codex, copilot, vibe, gemini.",
       inputSchema: {
         type: "object" as const,
