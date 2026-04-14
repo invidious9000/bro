@@ -30,6 +30,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       return [
         "-p", RECURSION_GUARD + prompt,
         "--output-format", "stream-json",
+        "--verbose",
         "--session-id", sessionId,
         "--dangerously-skip-permissions",
       ];
@@ -39,6 +40,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
         "--resume", sessionId,
         "-p", RECURSION_GUARD + prompt,
         "--output-format", "stream-json",
+        "--verbose",
         "--dangerously-skip-permissions",
       ];
     },
@@ -353,11 +355,9 @@ const VIBE_SESSION_DIR = process.env.VIBE_SESSION_DIR ||
   join(homedir(), ".vibe/logs/session");
 
 function discoverVibeSession(startMs: number, projectDir: string): string | null {
-  let files: string[];
+  let entries: string[];
   try {
-    files = readdirSync(VIBE_SESSION_DIR)
-      .filter((n) => n.endsWith(".json"))
-      .map((n) => join(VIBE_SESSION_DIR, n));
+    entries = readdirSync(VIBE_SESSION_DIR);
   } catch {
     return null;
   }
@@ -366,13 +366,18 @@ function discoverVibeSession(startMs: number, projectDir: string): string | null
   try { resolvedProjectDir = realpathSync(projectDir); }
   catch { resolvedProjectDir = projectDir; }
 
-  const scored = files
+  // Vibe stores sessions as directories: session_YYYYMMDD_HHMMSS_<shortid>/meta.json
+  const metaFiles = entries
+    .filter((n) => n.startsWith("session_"))
+    .map((n) => join(VIBE_SESSION_DIR, n, "meta.json"))
+    .filter((f) => { try { statSync(f); return true; } catch { return false; } });
+
+  const scored = metaFiles
     .map((file) => {
       try {
         const st = statSync(file);
         const data = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-        const meta = (data.metadata || {}) as Record<string, unknown>;
-        const env = (meta.environment || {}) as Record<string, unknown>;
+        const env = (data.environment || {}) as Record<string, unknown>;
         const wd = env.working_directory as string | undefined;
         let matchesDir = false;
         if (wd) {
@@ -380,7 +385,7 @@ function discoverVibeSession(startMs: number, projectDir: string): string | null
           catch { matchesDir = wd === projectDir; }
         }
         const recent = st.mtimeMs >= startMs - 2000;
-        const sessionId = meta.session_id as string | undefined;
+        const sessionId = data.session_id as string | undefined;
         return { file, mtimeMs: st.mtimeMs, matchesDir, recent, sessionId };
       } catch {
         return null;
