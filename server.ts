@@ -26,12 +26,10 @@ const RECURSION_GUARD =
 const PROVIDERS: Record<Provider, ProviderConfig> = {
   claude: {
     bin: process.env.CLAUDE_BIN || "claude",
-    maxTurns: Number(process.env.CLAUDE_MAX_TURNS) || 200,
     buildExecArgs(prompt, sessionId) {
       return [
         "-p", RECURSION_GUARD + prompt,
         "--output-format", "stream-json",
-        "--max-turns", String(this.maxTurns),
         "--session-id", sessionId,
         "--dangerously-skip-permissions",
       ];
@@ -41,7 +39,6 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
         "--resume", sessionId,
         "-p", RECURSION_GUARD + prompt,
         "--output-format", "stream-json",
-        "--max-turns", String(this.maxTurns),
         "--dangerously-skip-permissions",
       ];
     },
@@ -77,7 +74,6 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   codex: {
     bin: process.env.CODEX_BIN || "codex",
-    maxTurns: 0,
     buildExecArgs(prompt, _sessionId, cwd) {
       const args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"];
       if (cwd) args.push("-C", cwd);
@@ -116,14 +112,13 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   vibe: {
     bin: process.env.VIBE_BIN || "vibe",
-    maxTurns: Number(process.env.VIBE_MAX_TURNS) || 100,
     buildExecArgs(prompt) {
-      return ["-p", prompt, "--output", "json", "--max-turns", String(this.maxTurns)];
+      return ["-p", prompt, "--output", "json"];
     },
     buildResumeArgs(sessionId, prompt) {
       return [
         "--resume", sessionId,
-        "-p", prompt, "--output", "json", "--max-turns", String(this.maxTurns),
+        "-p", prompt, "--output", "json",
       ];
     },
     parseEvent(evt, task) {
@@ -143,7 +138,6 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   gemini: {
     bin: process.env.GEMINI_BIN || "gemini",
-    maxTurns: 0,
     buildExecArgs(prompt) {
       return ["-p", prompt, "--sandbox", "--yolo", "-o", "json"];
     },
@@ -183,7 +177,6 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
 
 interface ProviderConfig {
   bin: string;
-  maxTurns: number;
   buildExecArgs(prompt: string, sessionId: string, cwd?: string): string[];
   buildResumeArgs(sessionId: string, prompt: string): string[];
   parseEvent(evt: Record<string, unknown>, task: Task): void;
