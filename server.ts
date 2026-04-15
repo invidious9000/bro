@@ -837,6 +837,24 @@ function spawnTask(
       task.status = code === 0 ? "completed" : "failed";
     }
     task.completedAt = Date.now();
+
+    // Propagate discovered sessionId back to team member
+    if (task.sessionId && task.sessionId !== "pending") {
+      for (const team of loadAllTeams()) {
+        let dirty = false;
+        for (const member of team.members) {
+          if (
+            member.taskHistory.includes(id) &&
+            (!member.sessionId || member.sessionId === "pending")
+          ) {
+            member.sessionId = task.sessionId;
+            dirty = true;
+          }
+        }
+        if (dirty) saveTeam(team);
+      }
+    }
+
     persistTasks();
     for (const resolve of task.waiters) resolve();
     task.waiters = [];
@@ -1730,7 +1748,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
           const sessionId = brofile.provider === "claude" ? randomUUID() : "pending";
           const execArgs = PROVIDERS[brofile.provider].buildExecArgs(finalPrompt, sessionId, cwd, opts);
           task = spawnTask(brofile.provider, execArgs, sessionId, cwd, envOverrides);
-          if (!member.sessionId) member.sessionId = task.sessionId;
+          if (!member.sessionId || member.sessionId === "pending") member.sessionId = task.sessionId;
         }
 
         member.taskHistory.push(task.id);
