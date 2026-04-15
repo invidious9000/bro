@@ -1,8 +1,6 @@
 # bro
 
-Unified async MCP server for multi-provider agent orchestration.
-
-Launch Claude, Codex, GitHub Copilot, Vibe (Devstral), or Gemini as background agents through a single MCP interface. The `exec`/`wait` pattern solves the MCP timeout problem — `exec` returns immediately, `wait` blocks until the agent finishes.
+Multi-provider agent orchestration via MCP. Launch Claude, Codex, GitHub Copilot, Vibe (Devstral), or Gemini as background agents, organize them into named teams, and coordinate ensemble workflows.
 
 ## Install
 
@@ -12,33 +10,68 @@ cd bro
 npm install
 ```
 
-## Configure
+## Run
 
-### Claude Code (project-level)
+Bro runs as an HTTP daemon. Start it once, connect multiple MCP clients.
 
-`.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "bro": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/bro/server.ts"]
-    }
-  }
-}
+```bash
+npm start
+# bro daemon listening on http://127.0.0.1:7263/mcp
 ```
 
-### Claude Code (global)
+### Systemd (Linux — start on boot)
 
-Add to `~/.claude/.claude.json` under `mcpServers`:
+```bash
+# Create user service
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/bro.service << 'EOF'
+[Unit]
+Description=bro MCP daemon — multi-provider agent orchestration
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/bro
+ExecStart=/usr/bin/node /path/to/bro/node_modules/tsx/dist/cli.mjs /path/to/bro/server.ts
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable and start
+systemctl --user daemon-reload
+systemctl --user enable --now bro.service
+
+# Survive reboots without login
+loginctl enable-linger $USER
+
+# Check status / tail logs
+systemctl --user status bro
+journalctl --user -u bro -f
+```
+
+## Configure MCP Clients
+
+All clients connect via URL (not stdio):
+
+### Claude Code
+
+`~/.claude/.claude.json` under `mcpServers`:
 
 ```json
 "bro": {
-  "type": "stdio",
-  "command": "npx",
-  "args": ["tsx", "/path/to/bro/server.ts"]
+  "url": "http://127.0.0.1:7263/mcp"
 }
+```
+
+Or use the CLI:
+
+```bash
+claude mcp remove bro
+claude mcp add --transport http bro http://127.0.0.1:7263/mcp
 ```
 
 ### Codex CLI
@@ -47,36 +80,83 @@ Add to `~/.claude/.claude.json` under `mcpServers`:
 
 ```toml
 [mcp_servers.bro]
-command = "npx"
-args = ["tsx", "/path/to/bro/server.ts"]
+url = "http://127.0.0.1:7263/mcp"
 ```
 
 ## Tools
 
+### Core Orchestration
+
 | Tool | Description |
 |------|-------------|
-| `exec` | Launch an agent task. Returns `{taskId, sessionId}` immediately. |
-| `wait` | Block until a task completes. Returns normalized result. |
-| `resume` | Continue a previous session with a follow-up prompt. |
+| `exec` | Launch a task targeting a named bro or raw provider. Returns `{taskId}` immediately. |
+| `resume` | Continue a session by bro name (auto-resolves sessionId) or raw session_id + provider. |
+| `wait` | Block until a single task completes. |
+| `broadcast` | Send the same prompt to every member of a team. |
+| `when_all` | Block until ALL tasks complete (team or task_ids). |
+| `when_any` | Block until the FIRST task completes (team or task_ids). |
+
+### Operational
+
+| Tool | Description |
+|------|-------------|
 | `status` | Non-blocking progress check. |
+| `dashboard` | List recent tasks (filterable by provider, team, status). |
 | `cancel` | Kill a running task (SIGTERM). |
-| `providers` | List configured providers and whether their binaries are found. |
-| `dashboard` | List recent tasks/sessions. Look up forgotten taskIds. |
+| `providers` | List configured providers and binary availability. |
 
-## Usage pattern
+### Management (subcommand CRUD)
+
+| Tool | Actions |
+|------|---------|
+| `brofile` | `create`, `list`, `get`, `delete`, `set_account`, `list_accounts` |
+| `team` | `save_template`, `list_templates`, `delete_template`, `create`, `list`, `dissolve`, `roster` |
+
+## Concepts
+
+**Brofile** — a reusable template: provider + account + lens (personality/system prompt).
+
+**Bro instance** — a named runtime agent created when a team is instantiated. Tracks its own sessionId and task history. Target by name: `exec(bro: "alice", prompt: ...)`.
+
+**Teamplate** — an ensemble blueprint listing brofile slots.
+
+**Team** — an instantiated teamplate. Broadcast to it, when_all/when_any on it.
+
+## Usage
+
+### Ad-hoc (raw provider)
 
 ```
-exec(provider, prompt) -> {taskId, sessionId}
-wait(taskId)           -> {result, usage, elapsed, ...}
+exec(provider: "claude", prompt: "...") -> {taskId, sessionId}
+wait(taskId)                            -> {result, usage, ...}
 ```
 
-The `wait` tool description instructs the LLM to use maximum timeout and not cancel early. This is the key mechanism — splitting launch from join means the LLM doesn't prematurely abandon long-running agent work.
-
-For follow-ups on the same conversation:
+### Named bro workflow
 
 ```
-resume(sessionId, provider, prompt) -> {taskId, sessionId}
-wait(taskId)                        -> {result, ...}
+# Setup
+brofile(action: "create", name: "reviewer", provider: "claude", lens: "You are a senior code reviewer.")
+brofile(action: "create", name: "adversary", provider: "gemini", lens: "You are a devil's advocate.")
+team(action: "save_template", name: "review-panel", members: [{brofile: "reviewer"}, {brofile: "adversary"}])
+team(action: "create", template: "review-panel", name: "panel-1", project_dir: "/path/to/project")
+
+# Blind deliberation
+broadcast(team: "panel-1", prompt: "Review this PR")
+when_all(team: "panel-1")
+
+# Cross-pollinate
+resume(bro: "reviewer", prompt: "The adversary raised concern X. React.")
+
+# Final round
+broadcast(team: "panel-1", prompt: "Final verdict?")
+when_all(team: "panel-1")
+```
+
+### Racing providers
+
+```
+broadcast(team: "speed-test", prompt: "Solve this problem")
+when_any(team: "speed-test")  # returns as soon as the first one finishes
 ```
 
 ## Providers
@@ -85,42 +165,39 @@ wait(taskId)                        -> {result, ...}
 |----------|--------|--------|-------------------|
 | `claude` | `claude` | Yes | Pre-assigned UUID |
 | `codex` | `codex` | Yes | From `thread.started` event |
-| `copilot` | `gh copilot` | Yes | From `result` event `sessionId` field |
+| `copilot` | `gh copilot` | Yes | From `result` event |
 | `vibe` | `vibe` | Yes | Post-hoc from `~/.vibe/logs/session/` |
 | `gemini` | `gemini` | Yes | From JSON output `session_id` field |
 
-## Environment variables
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `BRO_PORT` | `7263` | HTTP daemon port |
 | `CLAUDE_BIN` | `claude` | Path to Claude Code CLI |
 | `CODEX_BIN` | `codex` | Path to Codex CLI |
-| `COPILOT_BIN` | `gh` | Path to GitHub CLI (copilot runs via `gh copilot`) |
+| `COPILOT_BIN` | `gh` | Path to GitHub CLI |
 | `VIBE_BIN` | `vibe` | Path to Vibe CLI |
 | `GEMINI_BIN` | `gemini` | Path to Gemini CLI |
-| `BRO_STORE` | `~/.bro` | Task persistence directory |
+| `BRO_STORE` | `~/.bro` | Persistence directory |
 | `BRO_EXTRA_PATH` | `~/.local/bin` | Prepended to PATH for spawned processes |
-| `BRO_TASK_TTL_MS` | `86400000` (24h) | How long completed tasks are retained |
-| `VIBE_SESSION_DIR` | `~/.vibe/logs/session` | Where Vibe writes session logs |
+| `BRO_TASK_TTL_MS` | `86400000` (24h) | Task retention |
+| `VIBE_SESSION_DIR` | `~/.vibe/logs/session` | Vibe session log directory |
 
-## How it works
+## Persistence
 
-Each provider has a spawn config that translates `exec`/`resume` into the correct CLI flags and a parser that normalizes provider-specific output into a common shape:
-
-```json
-{
-  "taskId": "uuid",
-  "provider": "claude",
-  "sessionId": "uuid",
-  "status": "completed",
-  "elapsed": "12s",
-  "result": "the agent's final response",
-  "usage": { "input_tokens": 1234, "output_tokens": 567 },
-  "costUsd": 0.04
-}
 ```
+~/.bro/
+  config.json       # Accounts registry (env var overrides per account)
+  tasks.json        # Task state
+  brofiles/         # Global brofile templates
+  teamplates/       # Global teamplate definitions
+  teams/            # Active team instances
 
-Task state is persisted to disk and survives server restarts. Running tasks from a previous server lifetime are marked as failed on reload.
+<project>/.bro/
+  brofiles/         # Project-local (overrides global)
+  teamplates/       # Project-local (overrides global)
+```
 
 ## License
 

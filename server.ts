@@ -1,5 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -8,7 +9,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   mkdirSync, readFileSync, readdirSync, realpathSync,
-  renameSync, statSync, writeFileSync,
+  renameSync, statSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -28,7 +29,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     bin: process.env.CLAUDE_BIN || "claude",
     buildExecArgs(prompt, sessionId) {
       return [
-        "-p", RECURSION_GUARD + prompt,
+        "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
         "--session-id", sessionId,
@@ -38,7 +39,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     buildResumeArgs(sessionId, prompt) {
       return [
         "--resume", sessionId,
-        "-p", RECURSION_GUARD + prompt,
+        "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
@@ -79,7 +80,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     buildExecArgs(prompt, _sessionId, cwd) {
       const args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"];
       if (cwd) args.push("-C", cwd);
-      args.push(RECURSION_GUARD + prompt);
+      args.push(prompt);
       return args;
     },
     buildResumeArgs(sessionId, prompt) {
@@ -87,7 +88,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
         "exec", "resume",
         "--dangerously-bypass-approvals-and-sandbox", "--json",
         sessionId,
-        RECURSION_GUARD + prompt,
+        prompt,
       ];
     },
     parseEvent(evt, task) {
@@ -117,7 +118,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     buildExecArgs(prompt, _sessionId, cwd) {
       const args = [
         "copilot", "--",
-        "-p", RECURSION_GUARD + prompt,
+        "-p", prompt,
         "--yolo", "--autopilot", "--output-format", "json",
       ];
       if (cwd) args.push("--add-dir", cwd);
@@ -127,7 +128,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       return [
         "copilot", "--",
         "--resume=" + sessionId,
-        "-p", RECURSION_GUARD + prompt,
+        "-p", prompt,
         "--yolo", "--autopilot", "--output-format", "json",
       ];
     },
@@ -243,6 +244,48 @@ interface ProviderConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Brofile / Teamplate / Team types
+// ---------------------------------------------------------------------------
+
+interface Account {
+  env?: Record<string, string>;
+}
+
+interface Brofile {
+  name: string;
+  provider: Provider;
+  account?: string;
+  lens?: string;
+  model?: string;
+}
+
+interface TeamplateMember {
+  brofile: string;
+  alias?: string;
+  count?: number;
+}
+
+interface Teamplate {
+  name: string;
+  members: TeamplateMember[];
+}
+
+interface BroInstance {
+  name: string;
+  brofile: string;
+  sessionId?: string;
+  taskHistory: string[];
+}
+
+interface Team {
+  name: string;
+  teamplate: string;
+  members: BroInstance[];
+  createdAt: number;
+  projectDir?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Disk persistence
 // ---------------------------------------------------------------------------
 
@@ -319,6 +362,199 @@ function loadPersistedTasks(): void {
   } catch {
     // no file or corrupt — start fresh
   }
+}
+
+// ---------------------------------------------------------------------------
+// Brofile / Teamplate / Team persistence
+// ---------------------------------------------------------------------------
+
+const BROFILES_DIR = join(STORE_DIR, "brofiles");
+const TEAMPLATES_DIR = join(STORE_DIR, "teamplates");
+const TEAMS_DIR = join(STORE_DIR, "teams");
+const CONFIG_FILE = join(STORE_DIR, "config.json");
+
+interface BroConfig {
+  accounts?: Record<string, Account>;
+}
+
+function loadConfig(): BroConfig {
+  try {
+    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as BroConfig;
+  } catch { return {}; }
+}
+
+function saveConfig(config: BroConfig): void {
+  mkdirSync(STORE_DIR, { recursive: true });
+  const tmp = CONFIG_FILE + ".tmp";
+  writeFileSync(tmp, JSON.stringify(config, null, 2));
+  renameSync(tmp, CONFIG_FILE);
+}
+
+function loadAccount(name: string): Account | null {
+  return loadConfig().accounts?.[name] ?? null;
+}
+
+function resolveBrofile(name: string, projectDir?: string): Brofile | null {
+  if (projectDir) {
+    const local = join(projectDir, ".bro", "brofiles", `${name}.json`);
+    try { return JSON.parse(readFileSync(local, "utf-8")) as Brofile; } catch {}
+  }
+  const global = join(BROFILES_DIR, `${name}.json`);
+  try { return JSON.parse(readFileSync(global, "utf-8")) as Brofile; } catch {}
+  return null;
+}
+
+function saveBrofile(brofile: Brofile, scope: "global" | "project", projectDir?: string): void {
+  const dir = scope === "project" && projectDir
+    ? join(projectDir, ".bro", "brofiles") : BROFILES_DIR;
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${brofile.name}.json`);
+  const tmp = file + ".tmp";
+  writeFileSync(tmp, JSON.stringify(brofile, null, 2));
+  renameSync(tmp, file);
+}
+
+function deleteBrofile(name: string, scope: "global" | "project", projectDir?: string): boolean {
+  const dir = scope === "project" && projectDir
+    ? join(projectDir, ".bro", "brofiles") : BROFILES_DIR;
+  try { unlinkSync(join(dir, `${name}.json`)); return true; } catch { return false; }
+}
+
+function listBrofiles(scope?: "global" | "project", projectDir?: string): Brofile[] {
+  const results: Brofile[] = [];
+  const seen = new Set<string>();
+  const dirs: Array<{ path: string; scope: string }> = [];
+  // Project-local first (wins on collision)
+  if ((!scope || scope === "project") && projectDir)
+    dirs.push({ path: join(projectDir, ".bro", "brofiles"), scope: "project" });
+  if (!scope || scope === "global")
+    dirs.push({ path: BROFILES_DIR, scope: "global" });
+  for (const { path: dir, scope: s } of dirs) {
+    try {
+      for (const f of readdirSync(dir).filter((f: string) => f.endsWith(".json"))) {
+        try {
+          const bf = JSON.parse(readFileSync(join(dir, f), "utf-8")) as Brofile;
+          if (!seen.has(bf.name)) {
+            seen.add(bf.name);
+            results.push({ ...bf, ...(s === "project" ? { _scope: "project" } : {}) } as Brofile);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  return results;
+}
+
+function resolveTeamplate(name: string, projectDir?: string): Teamplate | null {
+  if (projectDir) {
+    const local = join(projectDir, ".bro", "teamplates", `${name}.json`);
+    try { return JSON.parse(readFileSync(local, "utf-8")) as Teamplate; } catch {}
+  }
+  const global = join(TEAMPLATES_DIR, `${name}.json`);
+  try { return JSON.parse(readFileSync(global, "utf-8")) as Teamplate; } catch {}
+  return null;
+}
+
+function saveTeamplate(tp: Teamplate, scope: "global" | "project", projectDir?: string): void {
+  const dir = scope === "project" && projectDir
+    ? join(projectDir, ".bro", "teamplates") : TEAMPLATES_DIR;
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, `${tp.name}.json`);
+  const tmp = file + ".tmp";
+  writeFileSync(tmp, JSON.stringify(tp, null, 2));
+  renameSync(tmp, file);
+}
+
+function deleteTeamplate(name: string, scope: "global" | "project", projectDir?: string): boolean {
+  const dir = scope === "project" && projectDir
+    ? join(projectDir, ".bro", "teamplates") : TEAMPLATES_DIR;
+  try { unlinkSync(join(dir, `${name}.json`)); return true; } catch { return false; }
+}
+
+function listTeamplates(scope?: "global" | "project", projectDir?: string): Teamplate[] {
+  const results: Teamplate[] = [];
+  const seen = new Set<string>();
+  const dirs: Array<{ path: string; scope: string }> = [];
+  if ((!scope || scope === "project") && projectDir)
+    dirs.push({ path: join(projectDir, ".bro", "teamplates"), scope: "project" });
+  if (!scope || scope === "global")
+    dirs.push({ path: TEAMPLATES_DIR, scope: "global" });
+  for (const { path: dir } of dirs) {
+    try {
+      for (const f of readdirSync(dir).filter((f: string) => f.endsWith(".json"))) {
+        try {
+          const tp = JSON.parse(readFileSync(join(dir, f), "utf-8")) as Teamplate;
+          if (!seen.has(tp.name)) { seen.add(tp.name); results.push(tp); }
+        } catch {}
+      }
+    } catch {}
+  }
+  return results;
+}
+
+function loadTeam(name: string): Team | null {
+  try { return JSON.parse(readFileSync(join(TEAMS_DIR, `${name}.json`), "utf-8")) as Team; }
+  catch { return null; }
+}
+
+function saveTeam(team: Team): void {
+  mkdirSync(TEAMS_DIR, { recursive: true });
+  const file = join(TEAMS_DIR, `${team.name}.json`);
+  const tmp = file + ".tmp";
+  writeFileSync(tmp, JSON.stringify(team, null, 2));
+  renameSync(tmp, file);
+}
+
+function removeTeam(name: string): boolean {
+  try { unlinkSync(join(TEAMS_DIR, `${name}.json`)); return true; } catch { return false; }
+}
+
+function loadAllTeams(): Team[] {
+  try {
+    return readdirSync(TEAMS_DIR)
+      .filter((f: string) => f.endsWith(".json"))
+      .map((f: string) => JSON.parse(readFileSync(join(TEAMS_DIR, f), "utf-8")) as Team);
+  } catch { return []; }
+}
+
+function findBroInstance(broName: string): { team: Team; member: BroInstance } | null {
+  const matches: { team: Team; member: BroInstance }[] = [];
+  for (const team of loadAllTeams()) {
+    const member = team.members.find(m => m.name === broName);
+    if (member) matches.push({ team, member });
+  }
+  if (matches.length === 0) return null;
+  if (matches.length > 1)
+    throw new Error(
+      `Ambiguous bro "${broName}" — exists in teams: ${matches.map(m => m.team.name).join(", ")}. Use team/member syntax.`,
+    );
+  return matches[0];
+}
+
+function instantiateTeam(
+  teamplate: Teamplate, teamName: string, projectDir?: string,
+): Team {
+  const members: BroInstance[] = [];
+  for (const slot of teamplate.members) {
+    const count = slot.count ?? 1;
+    const baseName = slot.alias ?? slot.brofile;
+    for (let i = 0; i < count; i++) {
+      members.push({
+        name: count > 1 ? `${baseName}-${i + 1}` : baseName,
+        brofile: slot.brofile,
+        taskHistory: [],
+      });
+    }
+  }
+  const team: Team = {
+    name: teamName,
+    teamplate: teamplate.name,
+    members,
+    createdAt: Date.now(),
+    projectDir,
+  };
+  saveTeam(team);
+  return team;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,11 +642,22 @@ function discoverVibeSession(startMs: number, projectDir: string): string | null
 // Process spawning
 // ---------------------------------------------------------------------------
 
+function applyLens(
+  prompt: string,
+  lens?: string,
+  allowRecursion?: boolean,
+): string {
+  let result = allowRecursion ? prompt : RECURSION_GUARD + prompt;
+  if (lens) result = `${lens}\n\n${result}`;
+  return result;
+}
+
 function spawnTask(
   provider: Provider,
   args: string[],
   sessionId: string,
   cwd?: string,
+  envOverrides?: Record<string, string>,
 ): Task {
   const config = PROVIDERS[provider];
   const id = randomUUID();
@@ -433,6 +680,7 @@ function spawnTask(
     NO_COLOR: "1",
     TERM: "dumb",
     FORCE_COLOR: "0",
+    ...envOverrides,
   };
 
   const child = spawn(config.bin, args, spawnOpts);
@@ -574,6 +822,15 @@ function taskStatus(task: Task, tail = 0): Record<string, unknown> {
   return base;
 }
 
+function findBroNameForTask(taskId: string): string | null {
+  for (const team of loadAllTeams()) {
+    for (const member of team.members) {
+      if (member.taskHistory.includes(taskId)) return member.name;
+    }
+  }
+  return null;
+}
+
 function json(obj: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] };
 }
@@ -588,28 +845,33 @@ function err(msg: string) {
 
 const VALID_PROVIDERS = Object.keys(PROVIDERS);
 
-const server = new Server(
-  { name: "bro", version: "0.1.0" },
-  { capabilities: { tools: {} } },
-);
+function setupHandlers(srv: Server): void {
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+srv.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "exec",
       description:
-        "Launch an agent task. Returns {taskId, sessionId} immediately — " +
-        "the agent runs in the background. If you have other work to do, " +
-        "do it now and call wait later. If you have no other work, or the " +
-        "user asks you to wait, call wait immediately. " +
+        "Launch an agent task. Returns {taskId, sessionId, bro?} immediately — " +
+        "the agent runs in the background. Prefer targeting a named bro " +
+        "(resolves provider, account, and lens automatically) over raw provider. " +
+        "Use raw provider only for ad-hoc one-off tasks. " +
         `Providers: ${VALID_PROVIDERS.join(", ")}.`,
       inputSchema: {
         type: "object" as const,
         properties: {
+          bro: {
+            type: "string",
+            description:
+              "Named bro instance to target. Resolves provider, account, " +
+              "and lens from its brofile. Mutually exclusive with provider.",
+          },
           provider: {
             type: "string",
             enum: VALID_PROVIDERS,
-            description: "Which agent provider to use.",
+            description:
+              "Raw provider for ad-hoc tasks. Use bro param instead when " +
+              "targeting a named bro instance.",
           },
           prompt: {
             type: "string",
@@ -617,30 +879,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           project_dir: {
             type: "string",
-            description: "Working directory (absolute path).",
+            description: "Working directory (absolute path). Defaults to bro's team projectDir if targeting a named bro.",
+          },
+          allow_recursion: {
+            type: "boolean",
+            description:
+              "Skip the anti-recursion guard, allowing the spawned agent to " +
+              "call bro MCP tools. Default: false.",
           },
         },
-        required: ["provider", "prompt"],
+        required: ["prompt"],
       },
     },
     {
       name: "resume",
       description:
-        "Resume a previous agent session. Sends a follow-up prompt into the " +
-        "same conversation. Returns a new taskId on the same sessionId. " +
-        "Same rules as exec — do other work first, call wait when ready. " +
-        "Supported by: claude, codex, copilot, vibe, gemini.",
+        "Resume a previous agent session with a follow-up prompt. " +
+        "Prefer targeting a named bro (sessionId looked up automatically) " +
+        "over raw session_id + provider. Returns a new taskId on the same session.",
       inputSchema: {
         type: "object" as const,
         properties: {
+          bro: {
+            type: "string",
+            description:
+              "Named bro instance to resume. SessionId and provider resolved " +
+              "automatically. Mutually exclusive with session_id + provider.",
+          },
           session_id: {
             type: "string",
-            description: "sessionId from a prior exec or wait response.",
+            description: "sessionId from a prior exec or wait response. Requires provider.",
           },
           provider: {
             type: "string",
             enum: VALID_PROVIDERS,
-            description: "Must match the provider of the original session.",
+            description: "Must match the provider of the original session. Required with session_id.",
           },
           prompt: {
             type: "string",
@@ -650,8 +923,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             description: "Working directory (absolute path).",
           },
+          allow_recursion: {
+            type: "boolean",
+            description:
+              "Skip the anti-recursion guard. Default: false.",
+          },
         },
-        required: ["session_id", "provider", "prompt"],
+        required: ["prompt"],
       },
     },
     {
@@ -705,7 +983,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "dashboard",
       description:
         "List recent tasks and sessions. Shows task status, provider, " +
-        "sessionId, elapsed time, and whether the task has a result. " +
+        "bro name, sessionId, elapsed time, and whether the task has a result. " +
         "Use this to look up a taskId or sessionId you forgot.",
       inputSchema: {
         type: "object" as const,
@@ -714,6 +992,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "string",
             enum: VALID_PROVIDERS,
             description: "Filter by provider (optional).",
+          },
+          team: {
+            type: "string",
+            description: "Filter to tasks from a specific team (optional).",
           },
           status: {
             type: "string",
@@ -741,42 +1023,308 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["task_id"],
       },
     },
+    {
+      name: "broadcast",
+      description:
+        "Send the same prompt to every member of a team. Resumes existing " +
+        "sessions automatically; starts fresh for members with no session. " +
+        "Returns an array of {bro, taskId}. Follow up with when_all or when_any.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          team: {
+            type: "string",
+            description: "Team name to broadcast to.",
+          },
+          prompt: {
+            type: "string",
+            description: "Prompt sent to every team member.",
+          },
+          project_dir: {
+            type: "string",
+            description: "Working directory override (defaults to team's projectDir).",
+          },
+          allow_recursion: {
+            type: "boolean",
+            description: "Skip the anti-recursion guard. Default: false.",
+          },
+        },
+        required: ["team", "prompt"],
+      },
+    },
+    {
+      name: "when_all",
+      description:
+        "Block until ALL tasks complete. Accepts a team name (waits on each " +
+        "member's latest task) or an array of task IDs. Returns collected " +
+        "results for every task. USE MAXIMUM TIMEOUT. " +
+        "Use after broadcast for blind deliberation or provider comparison.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          team: {
+            type: "string",
+            description: "Team name — waits on each member's most recent task.",
+          },
+          task_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Explicit list of taskIds to await. Alternative to team.",
+          },
+        },
+      },
+    },
+    {
+      name: "when_any",
+      description:
+        "Block until the FIRST task completes. Accepts a team name or an " +
+        "array of task IDs. Returns all current states — the winner shows " +
+        "completed, others may still be running. USE MAXIMUM TIMEOUT. " +
+        "Use for racing providers or fast-path resolution.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          team: {
+            type: "string",
+            description: "Team name — races each member's most recent task.",
+          },
+          task_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Explicit list of taskIds to race. Alternative to team.",
+          },
+        },
+      },
+    },
+    {
+      name: "brofile",
+      description:
+        "Manage brofile templates and accounts. Brofiles define reusable agent " +
+        "configurations: provider + account + lens (personality/system prompt). " +
+        "Create brofiles before instantiating teams that reference them.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          action: {
+            type: "string",
+            enum: ["create", "list", "get", "delete", "set_account", "list_accounts"],
+            description: "Operation to perform.",
+          },
+          name: {
+            type: "string",
+            description: "Brofile or account name (required for create/get/delete/set_account).",
+          },
+          provider: {
+            type: "string",
+            enum: VALID_PROVIDERS,
+            description: "Agent provider (required for create).",
+          },
+          account: {
+            type: "string",
+            description: "Account name to use (optional, for create). References accounts registry.",
+          },
+          lens: {
+            type: "string",
+            description: "System prompt / personality override (optional, for create).",
+          },
+          model: {
+            type: "string",
+            description: "Model override (optional, for create).",
+          },
+          env: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: "Environment variable overrides (for set_account).",
+          },
+          scope: {
+            type: "string",
+            enum: ["global", "project"],
+            description: "Where to store/search (default: global). Project scope requires project_dir.",
+          },
+          project_dir: {
+            type: "string",
+            description: "Project directory for project-scoped operations.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+    {
+      name: "team",
+      description:
+        "Manage teamplates (ensemble blueprints) and team instances. " +
+        "Create a teamplate first, then instantiate it to get a named team " +
+        "you can broadcast to.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          action: {
+            type: "string",
+            enum: [
+              "save_template", "list_templates", "delete_template",
+              "create", "list", "dissolve", "roster",
+            ],
+            description: "Operation to perform.",
+          },
+          name: {
+            type: "string",
+            description: "Teamplate or team name.",
+          },
+          members: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                brofile: { type: "string", description: "Brofile name." },
+                alias: { type: "string", description: "Custom name for this slot." },
+                count: { type: "number", description: "Number of instances (default 1)." },
+              },
+              required: ["brofile"],
+            },
+            description: "Member slots (for save_template).",
+          },
+          template: {
+            type: "string",
+            description: "Teamplate to instantiate (for create).",
+          },
+          project_dir: {
+            type: "string",
+            description: "Working directory for the team (for create) or template scope.",
+          },
+          scope: {
+            type: "string",
+            enum: ["global", "project"],
+            description: "Where to store/search templates (default: global).",
+          },
+          cancel_running: {
+            type: "boolean",
+            description: "Cancel running tasks when dissolving (default: false).",
+          },
+        },
+        required: ["action"],
+      },
+    },
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+srv.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
     case "exec": {
-      const { provider, prompt, project_dir } = args as {
-        provider: Provider;
+      const { bro: broName, provider: rawProvider, prompt, project_dir, allow_recursion } = args as {
+        bro?: string;
+        provider?: Provider;
         prompt: string;
         project_dir?: string;
+        allow_recursion?: boolean;
       };
+
+      let provider: Provider;
+      let lens: string | undefined;
+      let envOverrides: Record<string, string> | undefined;
+      let cwd = project_dir;
+      let broMatch: { team: Team; member: BroInstance } | null = null;
+
+      if (broName) {
+        try { broMatch = findBroInstance(broName); } catch (e: unknown) {
+          return err((e as Error).message);
+        }
+        if (!broMatch) return err(`Unknown bro: ${broName}`);
+        const brofile = resolveBrofile(broMatch.member.brofile, broMatch.team.projectDir);
+        if (!brofile) return err(`Brofile not found: ${broMatch.member.brofile}`);
+        provider = brofile.provider;
+        lens = brofile.lens;
+        if (brofile.account) {
+          const acct = loadAccount(brofile.account);
+          if (acct?.env) envOverrides = acct.env;
+        }
+        if (!cwd) cwd = broMatch.team.projectDir;
+      } else if (rawProvider) {
+        provider = rawProvider;
+      } else {
+        return err("Provide either bro or provider");
+      }
+
       if (!PROVIDERS[provider]) return err(`Unknown provider: ${provider}`);
 
+      const finalPrompt = applyLens(prompt, lens, allow_recursion);
       const sessionId = provider === "claude" ? randomUUID() : "pending";
-      const execArgs = PROVIDERS[provider].buildExecArgs(prompt, sessionId, project_dir);
-      const task = spawnTask(provider, execArgs, sessionId, project_dir);
-      return json({ taskId: task.id, sessionId: task.sessionId, status: "running" });
+      const execArgs = PROVIDERS[provider].buildExecArgs(finalPrompt, sessionId, cwd);
+      const task = spawnTask(provider, execArgs, sessionId, cwd, envOverrides);
+
+      if (broMatch) {
+        broMatch.member.taskHistory.push(task.id);
+        if (!broMatch.member.sessionId || broMatch.member.sessionId === "pending") {
+          broMatch.member.sessionId = task.sessionId;
+        }
+        saveTeam(broMatch.team);
+      }
+
+      const result: Record<string, unknown> = { taskId: task.id, sessionId: task.sessionId, status: "running" };
+      if (broName) result.bro = broName;
+      return json(result);
     }
 
     case "resume": {
-      const { session_id, provider, prompt, project_dir } = args as {
-        session_id: string;
-        provider: Provider;
+      const { bro: broName, session_id, provider: rawProvider, prompt, project_dir, allow_recursion } = args as {
+        bro?: string;
+        session_id?: string;
+        provider?: Provider;
         prompt: string;
         project_dir?: string;
+        allow_recursion?: boolean;
       };
+
+      let provider: Provider;
+      let sessionId: string;
+      let lens: string | undefined;
+      let envOverrides: Record<string, string> | undefined;
+      let cwd = project_dir;
+      let broMatch: { team: Team; member: BroInstance } | null = null;
+
+      if (broName) {
+        try { broMatch = findBroInstance(broName); } catch (e: unknown) {
+          return err((e as Error).message);
+        }
+        if (!broMatch) return err(`Unknown bro: ${broName}`);
+        if (!broMatch.member.sessionId || broMatch.member.sessionId === "pending") {
+          return err(`Bro "${broName}" has no active session — use exec first`);
+        }
+        const brofile = resolveBrofile(broMatch.member.brofile, broMatch.team.projectDir);
+        if (!brofile) return err(`Brofile not found: ${broMatch.member.brofile}`);
+        provider = brofile.provider;
+        sessionId = broMatch.member.sessionId;
+        lens = brofile.lens;
+        if (brofile.account) {
+          const acct = loadAccount(brofile.account);
+          if (acct?.env) envOverrides = acct.env;
+        }
+        if (!cwd) cwd = broMatch.team.projectDir;
+      } else if (session_id && rawProvider) {
+        provider = rawProvider;
+        sessionId = session_id;
+      } else {
+        return err("Provide either bro, or session_id + provider");
+      }
+
       if (!PROVIDERS[provider]) return err(`Unknown provider: ${provider}`);
       if (!PROVIDERS[provider].supportsResume) {
         return err(`${provider} does not support session resume`);
       }
 
-      const resumeArgs = PROVIDERS[provider].buildResumeArgs(session_id, prompt);
-      const task = spawnTask(provider, resumeArgs, session_id, project_dir);
-      return json({ taskId: task.id, sessionId: session_id, status: "running" });
+      const finalPrompt = applyLens(prompt, lens, allow_recursion);
+      const resumeArgs = PROVIDERS[provider].buildResumeArgs(sessionId, finalPrompt);
+      const task = spawnTask(provider, resumeArgs, sessionId, cwd, envOverrides);
+
+      if (broMatch) {
+        broMatch.member.taskHistory.push(task.id);
+        saveTeam(broMatch.team);
+      }
+
+      const result: Record<string, unknown> = { taskId: task.id, sessionId, status: "running" };
+      if (broName) result.bro = broName;
+      return json(result);
     }
 
     case "wait": {
@@ -815,25 +1363,333 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "dashboard": {
-      const { provider: filterProvider, status: filterStatus, limit = 20 } = args as {
+      const { provider: filterProvider, team: filterTeam, status: filterStatus, limit = 20 } = args as {
         provider?: Provider;
+        team?: string;
         status?: Task["status"];
         limit?: number;
       };
+
+      // Build set of taskIds belonging to the filtered team
+      let teamTaskIds: Set<string> | null = null;
+      if (filterTeam) {
+        const team = loadTeam(filterTeam);
+        if (!team) return err(`Unknown team: ${filterTeam}`);
+        teamTaskIds = new Set(team.members.flatMap(m => m.taskHistory));
+      }
+
       const entries = [...tasks.values()]
         .filter((t) => !filterProvider || t.provider === filterProvider)
         .filter((t) => !filterStatus || t.status === filterStatus)
+        .filter((t) => !teamTaskIds || teamTaskIds.has(t.id))
         .sort((a, b) => b.startedAt - a.startedAt)
         .slice(0, limit)
-        .map((t) => ({
-          taskId: t.id,
-          provider: t.provider,
-          sessionId: t.sessionId,
-          status: t.status,
-          elapsed: elapsed(t),
-          hasResult: !!t.lastAssistantMessage,
-        }));
+        .map((t) => {
+          const broName = findBroNameForTask(t.id);
+          return {
+            taskId: t.id,
+            provider: t.provider,
+            ...(broName ? { bro: broName } : {}),
+            sessionId: t.sessionId,
+            status: t.status,
+            elapsed: elapsed(t),
+            hasResult: !!t.lastAssistantMessage,
+          };
+        });
       return json({ count: entries.length, tasks: entries });
+    }
+
+    case "broadcast": {
+      const { team: teamName, prompt, project_dir, allow_recursion } = args as {
+        team: string;
+        prompt: string;
+        project_dir?: string;
+        allow_recursion?: boolean;
+      };
+      const team = loadTeam(teamName);
+      if (!team) return err(`Unknown team: ${teamName}`);
+
+      const cwd = project_dir ?? team.projectDir;
+      const launched: Array<Record<string, unknown>> = [];
+
+      for (const member of team.members) {
+        const brofile = resolveBrofile(member.brofile, team.projectDir);
+        if (!brofile) {
+          launched.push({ bro: member.name, error: `Brofile not found: ${member.brofile}` });
+          continue;
+        }
+        if (!PROVIDERS[brofile.provider]) {
+          launched.push({ bro: member.name, error: `Unknown provider: ${brofile.provider}` });
+          continue;
+        }
+
+        const finalPrompt = applyLens(prompt, brofile.lens, allow_recursion);
+        let envOverrides: Record<string, string> | undefined;
+        if (brofile.account) {
+          const acct = loadAccount(brofile.account);
+          if (acct?.env) envOverrides = acct.env;
+        }
+
+        let task: Task;
+        if (member.sessionId && member.sessionId !== "pending") {
+          // Resume existing session
+          const resumeArgs = PROVIDERS[brofile.provider].buildResumeArgs(member.sessionId, finalPrompt);
+          task = spawnTask(brofile.provider, resumeArgs, member.sessionId, cwd, envOverrides);
+        } else {
+          // Fresh exec
+          const sessionId = brofile.provider === "claude" ? randomUUID() : "pending";
+          const execArgs = PROVIDERS[brofile.provider].buildExecArgs(finalPrompt, sessionId, cwd);
+          task = spawnTask(brofile.provider, execArgs, sessionId, cwd, envOverrides);
+          if (!member.sessionId) member.sessionId = task.sessionId;
+        }
+
+        member.taskHistory.push(task.id);
+        launched.push({ bro: member.name, taskId: task.id, sessionId: task.sessionId });
+      }
+
+      saveTeam(team);
+      return json({ team: teamName, tasks: launched });
+    }
+
+    case "when_all": {
+      const { team: teamName, task_ids: rawIds } = args as {
+        team?: string;
+        task_ids?: string[];
+      };
+
+      let taskIds: string[];
+      if (teamName) {
+        const team = loadTeam(teamName);
+        if (!team) return err(`Unknown team: ${teamName}`);
+        taskIds = team.members
+          .map(m => m.taskHistory[m.taskHistory.length - 1])
+          .filter(Boolean);
+        if (taskIds.length === 0) return err(`No tasks found for team ${teamName}`);
+      } else if (rawIds && rawIds.length > 0) {
+        taskIds = rawIds;
+      } else {
+        return err("Provide either team or task_ids");
+      }
+
+      await Promise.all(taskIds.map(id => {
+        const t = tasks.get(id);
+        return t ? waitForTask(t) : Promise.resolve();
+      }));
+
+      const results = taskIds.map(id => {
+        const t = tasks.get(id);
+        if (!t) return { taskId: id, error: "not found" };
+        // Find bro name for this task
+        const broName = findBroNameForTask(id);
+        const r = taskResult(t);
+        if (broName) r.bro = broName;
+        return r;
+      });
+      return json({ results });
+    }
+
+    case "when_any": {
+      const { team: teamName, task_ids: rawIds } = args as {
+        team?: string;
+        task_ids?: string[];
+      };
+
+      let taskIds: string[];
+      if (teamName) {
+        const team = loadTeam(teamName);
+        if (!team) return err(`Unknown team: ${teamName}`);
+        taskIds = team.members
+          .map(m => m.taskHistory[m.taskHistory.length - 1])
+          .filter(Boolean);
+        if (taskIds.length === 0) return err(`No tasks found for team ${teamName}`);
+      } else if (rawIds && rawIds.length > 0) {
+        taskIds = rawIds;
+      } else {
+        return err("Provide either team or task_ids");
+      }
+
+      // If any task is already done, return immediately; otherwise race
+      const running = taskIds.filter(id => {
+        const t = tasks.get(id);
+        return t && t.status === "running";
+      });
+      if (running.length > 0) {
+        await Promise.race(running.map(id => waitForTask(tasks.get(id)!)));
+      }
+
+      const results = taskIds.map(id => {
+        const t = tasks.get(id);
+        if (!t) return { taskId: id, error: "not found" };
+        const broName = findBroNameForTask(id);
+        const r = taskResult(t);
+        if (broName) r.bro = broName;
+        return r;
+      });
+      return json({ results });
+    }
+
+    case "brofile": {
+      const { action, name: bfName, provider: bfProvider, account: bfAccount,
+              lens: bfLens, model: bfModel, env: bfEnv,
+              scope = "global", project_dir } = args as {
+        action: string;
+        name?: string;
+        provider?: Provider;
+        account?: string;
+        lens?: string;
+        model?: string;
+        env?: Record<string, string>;
+        scope?: "global" | "project";
+        project_dir?: string;
+      };
+
+      switch (action) {
+        case "create": {
+          if (!bfName) return err("name is required");
+          if (!bfProvider) return err("provider is required");
+          if (!PROVIDERS[bfProvider]) return err(`Unknown provider: ${bfProvider}`);
+          if (scope === "project" && !project_dir) return err("project_dir required for project scope");
+          const bf: Brofile = {
+            name: bfName, provider: bfProvider,
+            ...(bfAccount ? { account: bfAccount } : {}),
+            ...(bfLens ? { lens: bfLens } : {}),
+            ...(bfModel ? { model: bfModel } : {}),
+          };
+          saveBrofile(bf, scope, project_dir);
+          return json({ created: bfName, scope, brofile: bf });
+        }
+        case "list":
+          return json(listBrofiles(scope, project_dir));
+        case "get": {
+          if (!bfName) return err("name is required");
+          const bf = resolveBrofile(bfName, project_dir);
+          if (!bf) return err(`Brofile not found: ${bfName}`);
+          return json(bf);
+        }
+        case "delete": {
+          if (!bfName) return err("name is required");
+          if (scope === "project" && !project_dir) return err("project_dir required for project scope");
+          const ok = deleteBrofile(bfName, scope, project_dir);
+          return ok ? json({ deleted: bfName }) : err(`Brofile not found: ${bfName}`);
+        }
+        case "set_account": {
+          if (!bfName) return err("name is required");
+          const config = loadConfig();
+          if (!config.accounts) config.accounts = {};
+          config.accounts[bfName] = { env: bfEnv };
+          saveConfig(config);
+          return json({ account: bfName, env: bfEnv });
+        }
+        case "list_accounts":
+          return json(loadConfig().accounts ?? {});
+        default:
+          return err(`Unknown brofile action: ${action}`);
+      }
+    }
+
+    case "team": {
+      const { action, name: tmName, members: tmMembers, template: tmTemplate,
+              project_dir, scope = "global", cancel_running } = args as {
+        action: string;
+        name?: string;
+        members?: TeamplateMember[];
+        template?: string;
+        project_dir?: string;
+        scope?: "global" | "project";
+        cancel_running?: boolean;
+      };
+
+      switch (action) {
+        case "save_template": {
+          if (!tmName) return err("name is required");
+          if (!tmMembers || tmMembers.length === 0) return err("members is required");
+          if (scope === "project" && !project_dir) return err("project_dir required for project scope");
+          // Validate brofile names
+          for (const m of tmMembers) {
+            const bf = resolveBrofile(m.brofile, project_dir);
+            if (!bf) return err(`Brofile not found: ${m.brofile}`);
+          }
+          const tp: Teamplate = { name: tmName, members: tmMembers };
+          saveTeamplate(tp, scope, project_dir);
+          return json({ saved: tmName, scope, teamplate: tp });
+        }
+        case "list_templates":
+          return json(listTeamplates(scope, project_dir));
+        case "delete_template": {
+          if (!tmName) return err("name is required");
+          if (scope === "project" && !project_dir) return err("project_dir required for project scope");
+          const ok = deleteTeamplate(tmName, scope, project_dir);
+          return ok ? json({ deleted: tmName }) : err(`Teamplate not found: ${tmName}`);
+        }
+        case "create": {
+          if (!tmTemplate) return err("template is required");
+          const tp = resolveTeamplate(tmTemplate, project_dir);
+          if (!tp) return err(`Teamplate not found: ${tmTemplate}`);
+          const teamName = tmName ?? `${tmTemplate}-${Date.now()}`;
+          // Validate all brofiles exist before instantiating
+          for (const m of tp.members) {
+            const bf = resolveBrofile(m.brofile, project_dir);
+            if (!bf) return err(`Brofile not found: ${m.brofile}`);
+          }
+          const team = instantiateTeam(tp, teamName, project_dir);
+          return json({
+            created: team.name,
+            teamplate: tp.name,
+            members: team.members.map(m => ({ name: m.name, brofile: m.brofile })),
+          });
+        }
+        case "list":
+          return json(loadAllTeams().map(t => ({
+            name: t.name, teamplate: t.teamplate,
+            memberCount: t.members.length, createdAt: t.createdAt,
+            projectDir: t.projectDir,
+          })));
+        case "dissolve": {
+          if (!tmName) return err("name is required");
+          const team = loadTeam(tmName);
+          if (!team) return err(`Unknown team: ${tmName}`);
+          if (cancel_running) {
+            for (const member of team.members) {
+              for (const tid of member.taskHistory) {
+                const t = tasks.get(tid);
+                if (t && t.status === "running" && t.process) {
+                  t.status = "cancelled";
+                  t.completedAt = Date.now();
+                  t.process.kill("SIGTERM");
+                  for (const resolve of t.waiters) resolve();
+                  t.waiters = [];
+                }
+              }
+            }
+            persistTasks();
+          }
+          removeTeam(tmName);
+          return json({ dissolved: tmName });
+        }
+        case "roster": {
+          if (!tmName) return err("name is required");
+          const team = loadTeam(tmName);
+          if (!team) return err(`Unknown team: ${tmName}`);
+          const roster = team.members.map(m => {
+            const latestTaskId = m.taskHistory[m.taskHistory.length - 1];
+            const latestTask = latestTaskId ? tasks.get(latestTaskId) : undefined;
+            return {
+              name: m.name,
+              brofile: m.brofile,
+              sessionId: m.sessionId ?? null,
+              taskCount: m.taskHistory.length,
+              latestTask: latestTask ? {
+                taskId: latestTaskId,
+                status: latestTask.status,
+                elapsed: elapsed(latestTask),
+              } : null,
+            };
+          });
+          return json({ team: tmName, teamplate: team.teamplate, members: roster });
+        }
+        default:
+          return err(`Unknown team action: ${action}`);
+      }
     }
 
     case "cancel": {
@@ -856,10 +1712,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+} // setupHandlers
+
 // ---------------------------------------------------------------------------
-// Start
+// Start — HTTP daemon
 // ---------------------------------------------------------------------------
 
+const BRO_PORT = Number(process.env.BRO_PORT) || 7263;
+const sessions = new Map<string, { transport: StreamableHTTPServerTransport; server: Server }>();
+
 loadPersistedTasks();
-const transport = new StdioServerTransport();
-await server.connect(transport);
+
+const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const url = new URL(req.url || "/", `http://localhost:${BRO_PORT}`);
+  if (url.pathname !== "/mcp") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  if (sessionId) {
+    const session = sessions.get(sessionId);
+    if (session) {
+      await session.transport.handleRequest(req, res);
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unknown session" }));
+    }
+    return;
+  }
+
+  // New MCP session
+  const sessionServer = new Server(
+    { name: "bro", version: "0.2.0" },
+    { capabilities: { tools: {} } },
+  );
+  setupHandlers(sessionServer);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id: string) => { sessions.set(id, { transport, server: sessionServer }); },
+    onsessionclosed: (id: string) => { sessions.delete(id); },
+  });
+  await sessionServer.connect(transport);
+  await transport.handleRequest(req, res);
+});
+
+httpServer.listen(BRO_PORT, "127.0.0.1", () => {
+  console.error(`bro daemon listening on http://127.0.0.1:${BRO_PORT}/mcp`);
+});
