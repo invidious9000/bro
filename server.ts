@@ -27,23 +27,27 @@ const RECURSION_GUARD =
 const PROVIDERS: Record<Provider, ProviderConfig> = {
   claude: {
     bin: process.env.CLAUDE_BIN || "claude",
-    buildExecArgs(prompt, sessionId) {
-      return [
+    buildExecArgs(prompt, sessionId, _cwd, opts) {
+      const args = [
         "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
         "--session-id", sessionId,
         "--dangerously-skip-permissions",
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
-    buildResumeArgs(sessionId, prompt) {
-      return [
+    buildResumeArgs(sessionId, prompt, opts) {
+      const args = [
         "--resume", sessionId,
         "-p", prompt,
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
     parseEvent(evt, task) {
       if (evt.type === "assistant") {
@@ -77,19 +81,23 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   codex: {
     bin: process.env.CODEX_BIN || "codex",
-    buildExecArgs(prompt, _sessionId, cwd) {
+    buildExecArgs(prompt, _sessionId, cwd, opts) {
       const args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"];
+      if (opts?.model) args.push("--model", opts.model);
+      if (opts?.effort) args.push("--reasoning-effort", opts.effort);
       if (cwd) args.push("-C", cwd);
       args.push(prompt);
       return args;
     },
-    buildResumeArgs(sessionId, prompt) {
-      return [
+    buildResumeArgs(sessionId, prompt, opts) {
+      const args = [
         "exec", "resume",
         "--dangerously-bypass-approvals-and-sandbox", "--json",
-        sessionId,
-        prompt,
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      if (opts?.effort) args.push("--reasoning-effort", opts.effort);
+      args.push(sessionId, prompt);
+      return args;
     },
     parseEvent(evt, task) {
       if (evt.type === "item.completed") {
@@ -115,22 +123,25 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   copilot: {
     bin: process.env.COPILOT_BIN || "gh",
-    buildExecArgs(prompt, _sessionId, cwd) {
+    buildExecArgs(prompt, _sessionId, cwd, opts) {
       const args = [
         "copilot", "--",
         "-p", prompt,
         "--yolo", "--autopilot", "--output-format", "json",
       ];
+      if (opts?.model) args.push("--model", opts.model);
       if (cwd) args.push("--add-dir", cwd);
       return args;
     },
-    buildResumeArgs(sessionId, prompt) {
-      return [
+    buildResumeArgs(sessionId, prompt, opts) {
+      const args = [
         "copilot", "--",
         "--resume=" + sessionId,
         "-p", prompt,
         "--yolo", "--autopilot", "--output-format", "json",
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
     parseEvent(evt, task) {
       // assistant.message — direct text responses
@@ -171,14 +182,18 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   vibe: {
     bin: process.env.VIBE_BIN || "vibe",
-    buildExecArgs(prompt) {
-      return ["-p", prompt, "--output", "json"];
+    buildExecArgs(prompt, _sessionId, _cwd, opts) {
+      const args = ["-p", prompt, "--output", "json"];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
-    buildResumeArgs(sessionId, prompt) {
-      return [
+    buildResumeArgs(sessionId, prompt, opts) {
+      const args = [
         "--resume", sessionId,
         "-p", prompt, "--output", "json",
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
     parseEvent(evt, task) {
       if (Array.isArray(evt)) {
@@ -197,14 +212,18 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
   gemini: {
     bin: process.env.GEMINI_BIN || "gemini",
-    buildExecArgs(prompt) {
-      return ["-p", prompt, "--yolo", "-o", "json"];
+    buildExecArgs(prompt, _sessionId, _cwd, opts) {
+      const args = ["-p", prompt, "--yolo", "-o", "json"];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
-    buildResumeArgs(sessionId, prompt) {
-      return [
+    buildResumeArgs(sessionId, prompt, opts) {
+      const args = [
         "--resume", sessionId,
         "-p", prompt, "--yolo", "-o", "json",
       ];
+      if (opts?.model) args.push("--model", opts.model);
+      return args;
     },
     parseEvent(evt, task) {
       const obj = evt as Record<string, unknown>;
@@ -234,10 +253,15 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
   },
 };
 
+interface BroExecOpts {
+  model?: string;
+  effort?: string;
+}
+
 interface ProviderConfig {
   bin: string;
-  buildExecArgs(prompt: string, sessionId: string, cwd?: string): string[];
-  buildResumeArgs(sessionId: string, prompt: string): string[];
+  buildExecArgs(prompt: string, sessionId: string, cwd?: string, opts?: BroExecOpts): string[];
+  buildResumeArgs(sessionId: string, prompt: string, opts?: BroExecOpts): string[];
   parseEvent(evt: Record<string, unknown>, task: Task): void;
   extractSessionId(evt: Record<string, unknown>, task: Task): void;
   supportsResume: boolean;
@@ -257,6 +281,7 @@ interface Brofile {
   account?: string;
   lens?: string;
   model?: string;
+  effort?: string;
 }
 
 interface TeamplateMember {
@@ -1129,7 +1154,11 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           model: {
             type: "string",
-            description: "Model override (optional, for create).",
+            description: "Model override (optional, for create). Passed as --model to the provider CLI.",
+          },
+          effort: {
+            type: "string",
+            description: "Reasoning effort level (optional, for create). E.g. 'low', 'medium', 'high'. Provider-specific.",
           },
           env: {
             type: "object",
@@ -1223,6 +1252,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
       let provider: Provider;
       let lens: string | undefined;
       let envOverrides: Record<string, string> | undefined;
+      let execOpts: BroExecOpts | undefined;
       let cwd = project_dir;
       let broMatch: { team: Team; member: BroInstance } | null = null;
 
@@ -1235,6 +1265,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!brofile) return err(`Brofile not found: ${broMatch.member.brofile}`);
         provider = brofile.provider;
         lens = brofile.lens;
+        if (brofile.model || brofile.effort) execOpts = { model: brofile.model, effort: brofile.effort };
         if (brofile.account) {
           const acct = loadAccount(brofile.account);
           if (acct?.env) envOverrides = acct.env;
@@ -1250,7 +1281,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const finalPrompt = applyLens(prompt, lens, allow_recursion);
       const sessionId = provider === "claude" ? randomUUID() : "pending";
-      const execArgs = PROVIDERS[provider].buildExecArgs(finalPrompt, sessionId, cwd);
+      const execArgs = PROVIDERS[provider].buildExecArgs(finalPrompt, sessionId, cwd, execOpts);
       const task = spawnTask(provider, execArgs, sessionId, cwd, envOverrides);
 
       if (broMatch) {
@@ -1280,6 +1311,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
       let sessionId: string;
       let lens: string | undefined;
       let envOverrides: Record<string, string> | undefined;
+      let execOpts: BroExecOpts | undefined;
       let cwd = project_dir;
       let broMatch: { team: Team; member: BroInstance } | null = null;
 
@@ -1296,6 +1328,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         provider = brofile.provider;
         sessionId = broMatch.member.sessionId;
         lens = brofile.lens;
+        if (brofile.model || brofile.effort) execOpts = { model: brofile.model, effort: brofile.effort };
         if (brofile.account) {
           const acct = loadAccount(brofile.account);
           if (acct?.env) envOverrides = acct.env;
@@ -1314,7 +1347,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const finalPrompt = applyLens(prompt, lens, allow_recursion);
-      const resumeArgs = PROVIDERS[provider].buildResumeArgs(sessionId, finalPrompt);
+      const resumeArgs = PROVIDERS[provider].buildResumeArgs(sessionId, finalPrompt, execOpts);
       const task = spawnTask(provider, resumeArgs, sessionId, cwd, envOverrides);
 
       if (broMatch) {
@@ -1429,16 +1462,18 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
           const acct = loadAccount(brofile.account);
           if (acct?.env) envOverrides = acct.env;
         }
+        const opts: BroExecOpts | undefined =
+          (brofile.model || brofile.effort) ? { model: brofile.model, effort: brofile.effort } : undefined;
 
         let task: Task;
         if (member.sessionId && member.sessionId !== "pending") {
           // Resume existing session
-          const resumeArgs = PROVIDERS[brofile.provider].buildResumeArgs(member.sessionId, finalPrompt);
+          const resumeArgs = PROVIDERS[brofile.provider].buildResumeArgs(member.sessionId, finalPrompt, opts);
           task = spawnTask(brofile.provider, resumeArgs, member.sessionId, cwd, envOverrides);
         } else {
           // Fresh exec
           const sessionId = brofile.provider === "claude" ? randomUUID() : "pending";
-          const execArgs = PROVIDERS[brofile.provider].buildExecArgs(finalPrompt, sessionId, cwd);
+          const execArgs = PROVIDERS[brofile.provider].buildExecArgs(finalPrompt, sessionId, cwd, opts);
           task = spawnTask(brofile.provider, execArgs, sessionId, cwd, envOverrides);
           if (!member.sessionId) member.sessionId = task.sessionId;
         }
@@ -1530,7 +1565,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "brofile": {
       const { action, name: bfName, provider: bfProvider, account: bfAccount,
-              lens: bfLens, model: bfModel, env: bfEnv,
+              lens: bfLens, model: bfModel, effort: bfEffort, env: bfEnv,
               scope = "global", project_dir } = args as {
         action: string;
         name?: string;
@@ -1538,6 +1573,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         account?: string;
         lens?: string;
         model?: string;
+        effort?: string;
         env?: Record<string, string>;
         scope?: "global" | "project";
         project_dir?: string;
@@ -1554,6 +1590,7 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
             ...(bfAccount ? { account: bfAccount } : {}),
             ...(bfLens ? { lens: bfLens } : {}),
             ...(bfModel ? { model: bfModel } : {}),
+            ...(bfEffort ? { effort: bfEffort } : {}),
           };
           saveBrofile(bf, scope, project_dir);
           return json({ created: bfName, scope, brofile: bf });
