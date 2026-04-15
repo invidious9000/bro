@@ -334,6 +334,7 @@ interface PersistedTask {
   completedAt?: number;
   exitCode?: number | null;
   cwd?: string;
+  lastEventAt?: number;
 }
 
 function persistTasks(): void {
@@ -354,6 +355,7 @@ function persistTasks(): void {
       completedAt: task.completedAt,
       exitCode: task.exitCode,
       cwd: task.cwd,
+      lastEventAt: task.lastEventAt,
     });
   }
   try {
@@ -603,6 +605,7 @@ interface Task {
   completedAt?: number;
   exitCode?: number | null;
   cwd?: string;
+  lastEventAt?: number;
 }
 
 const tasks = new Map<string, Task>();
@@ -732,6 +735,7 @@ function spawnTask(
       try {
         const evt = JSON.parse(line) as Record<string, unknown>;
         task.events.push(evt);
+        task.lastEventAt = Date.now();
         config.parseEvent(evt, task);
         config.extractSessionId(evt, task);
       } catch {
@@ -753,6 +757,7 @@ function spawnTask(
     if (!isStreamingJson && rawStdout.trim()) {
       try {
         const parsed = JSON.parse(rawStdout.trim());
+        task.lastEventAt = Date.now();
         config.parseEvent(parsed, task);
       } catch {
         task.lastAssistantMessage = rawStdout.trim();
@@ -798,6 +803,77 @@ function waitForTask(task: Task): Promise<void> {
   return new Promise((resolve) => {
     task.waiters.push(resolve);
   });
+}
+
+/** Wait with optional timeout. Returns true if task completed, false if timed out. */
+function waitForTaskWithTimeout(task: Task, timeoutSeconds?: number): Promise<boolean> {
+  if (task.status !== "running") return Promise.resolve(true);
+  if (timeoutSeconds == null) {
+    return waitForTask(task).then(() => true);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const onDone = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      // Remove our waiter from the list
+      const idx = task.waiters.indexOf(onDone);
+      if (idx !== -1) task.waiters.splice(idx, 1);
+      resolve(false);
+    }, timeoutSeconds * 1000);
+    task.waiters.push(onDone);
+  });
+}
+
+type KeepGoing = "yes" | "no" | "check_status";
+
+function keepGoing(task: Task): KeepGoing {
+  // Process gone or exited but status hasn't flipped yet — zombie
+  if (task.process && task.process.exitCode != null && task.status === "running") return "no";
+  // Task already terminal
+  if (task.status !== "running") return "no";
+  // Has recent event activity (within last 60s) — actively working
+  if (task.lastEventAt && (Date.now() - task.lastEventAt) < 60_000) return "yes";
+  // No events at all yet but started recently (< 30s) — still spinning up
+  if (!task.lastEventAt && (Date.now() - task.startedAt) < 30_000) return "yes";
+  // stderr growing could be warnings or imminent crash — worth checking
+  if (task.stderr.length > 0) return "check_status";
+  // No recent activity but process is alive — could be thinking, could be stuck
+  return "check_status";
+}
+
+function timeoutSnapshot(task: Task): Record<string, unknown> {
+  const snap: Record<string, unknown> = {
+    taskId: task.id,
+    provider: task.provider,
+    sessionId: task.sessionId,
+    status: task.status,
+    timed_out: true,
+    elapsed: elapsed(task),
+    eventCount: task.events.length,
+    keep_going: keepGoing(task),
+  };
+  const broName = findBroNameForTask(task.id);
+  if (broName) snap.bro = broName;
+  if (task.lastAssistantMessage) {
+    // Last 500 chars as a snippet, not the full message
+    snap.lastAssistantSnippet = task.lastAssistantMessage.length > 500
+      ? "…" + task.lastAssistantMessage.slice(-500)
+      : task.lastAssistantMessage;
+  }
+  if (task.lastEventAt) {
+    snap.lastActivitySecsAgo = Math.round((Date.now() - task.lastEventAt) / 1000);
+  }
+  if (task.stderr) {
+    snap.stderr = task.stderr.slice(-500);
+  }
+  return snap;
 }
 
 // ---------------------------------------------------------------------------
@@ -961,16 +1037,26 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
       name: "wait",
       description:
         "Block until a task completes and return its result. " +
-        "This call will not return until the agent finishes. " +
-        "USE MAXIMUM TIMEOUT. DO NOT CANCEL EARLY. " +
         "If the task is already finished, returns immediately. " +
-        "Multiple callers can wait on the same taskId.",
+        "Multiple callers can wait on the same taskId. " +
+        "With timeout_seconds, returns a progress snapshot if the task " +
+        "hasn't finished yet, including a keep_going cue: " +
+        "\"yes\" (actively working, wait again), \"no\" (dead/done, stop waiting), " +
+        "\"check_status\" (ambiguous — call status with tail before deciding). " +
+        "Without timeout_seconds, blocks indefinitely — USE MAXIMUM TIMEOUT.",
       inputSchema: {
         type: "object" as const,
         properties: {
           task_id: {
             type: "string",
             description: "taskId from exec or resume.",
+          },
+          timeout_seconds: {
+            type: "number",
+            description:
+              "Max seconds to wait. If the task hasn't finished by then, " +
+              "returns a progress snapshot with keep_going cue instead of blocking forever. " +
+              "Recommended: 120.",
           },
         },
         required: ["task_id"],
@@ -1082,7 +1168,10 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Block until ALL tasks complete. Accepts a team name (waits on each " +
         "member's latest task) or an array of task IDs. Returns collected " +
-        "results for every task. USE MAXIMUM TIMEOUT. " +
+        "results for every task. " +
+        "With timeout_seconds, returns per-task snapshots with keep_going cues " +
+        "for any tasks still running. Without timeout_seconds, blocks indefinitely — " +
+        "USE MAXIMUM TIMEOUT. " +
         "Use after broadcast for blind deliberation or provider comparison.",
       inputSchema: {
         type: "object" as const,
@@ -1096,6 +1185,12 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
             items: { type: "string" },
             description: "Explicit list of taskIds to await. Alternative to team.",
           },
+          timeout_seconds: {
+            type: "number",
+            description:
+              "Max seconds to wait. Returns progress snapshots for still-running tasks. " +
+              "Recommended: 120.",
+          },
         },
       },
     },
@@ -1104,7 +1199,9 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Block until the FIRST task completes. Accepts a team name or an " +
         "array of task IDs. Returns all current states — the winner shows " +
-        "completed, others may still be running. USE MAXIMUM TIMEOUT. " +
+        "completed, others may still be running. " +
+        "With timeout_seconds, returns progress snapshots if no task finished in time. " +
+        "Without timeout_seconds, blocks indefinitely — USE MAXIMUM TIMEOUT. " +
         "Use for racing providers or fast-path resolution.",
       inputSchema: {
         type: "object" as const,
@@ -1117,6 +1214,12 @@ srv.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: "array",
             items: { type: "string" },
             description: "Explicit list of taskIds to race. Alternative to team.",
+          },
+          timeout_seconds: {
+            type: "number",
+            description:
+              "Max seconds to wait for first completion. " +
+              "Recommended: 120.",
           },
         },
       },
@@ -1361,11 +1464,12 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "wait": {
-      const { task_id } = args as { task_id: string };
+      const { task_id, timeout_seconds } = args as { task_id: string; timeout_seconds?: number };
       const task = tasks.get(task_id);
       if (!task) return err(`Unknown task ID: ${task_id}`);
-      await waitForTask(task);
-      return json(taskResult(task));
+      const completed = await waitForTaskWithTimeout(task, timeout_seconds);
+      if (completed) return json(taskResult(task));
+      return json(timeoutSnapshot(task));
     }
 
     case "status": {
@@ -1487,9 +1591,10 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "when_all": {
-      const { team: teamName, task_ids: rawIds } = args as {
+      const { team: teamName, task_ids: rawIds, timeout_seconds } = args as {
         team?: string;
         task_ids?: string[];
+        timeout_seconds?: number;
       };
 
       let taskIds: string[];
@@ -1506,27 +1611,32 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         return err("Provide either team or task_ids");
       }
 
-      await Promise.all(taskIds.map(id => {
+      const completions = await Promise.all(taskIds.map(id => {
         const t = tasks.get(id);
-        return t ? waitForTask(t) : Promise.resolve();
+        return t ? waitForTaskWithTimeout(t, timeout_seconds) : Promise.resolve(true);
       }));
 
-      const results = taskIds.map(id => {
+      const results = taskIds.map((id, i) => {
         const t = tasks.get(id);
         if (!t) return { taskId: id, error: "not found" };
-        // Find bro name for this task
         const broName = findBroNameForTask(id);
-        const r = taskResult(t);
-        if (broName) r.bro = broName;
-        return r;
+        // Completed or no timeout — return full result; otherwise snapshot
+        if (completions[i]) {
+          const r = taskResult(t);
+          if (broName) r.bro = broName;
+          return r;
+        }
+        return timeoutSnapshot(t);
       });
-      return json({ results });
+      const allDone = completions.every(Boolean);
+      return json({ all_completed: allDone, results });
     }
 
     case "when_any": {
-      const { team: teamName, task_ids: rawIds } = args as {
+      const { team: teamName, task_ids: rawIds, timeout_seconds } = args as {
         team?: string;
         task_ids?: string[];
+        timeout_seconds?: number;
       };
 
       let taskIds: string[];
@@ -1543,24 +1653,38 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         return err("Provide either team or task_ids");
       }
 
-      // If any task is already done, return immediately; otherwise race
+      // If any task is already done, return immediately; otherwise race (with optional timeout)
       const running = taskIds.filter(id => {
         const t = tasks.get(id);
         return t && t.status === "running";
       });
-      if (running.length > 0) {
-        await Promise.race(running.map(id => waitForTask(tasks.get(id)!)));
+      let anyFinished = running.length < taskIds.length; // Some already done
+      if (!anyFinished && running.length > 0) {
+        if (timeout_seconds != null) {
+          // Race all running tasks against the timeout
+          const winner = await Promise.race([
+            ...running.map(id => waitForTaskWithTimeout(tasks.get(id)!, undefined).then(() => true)),
+            new Promise<false>(resolve => setTimeout(() => resolve(false), timeout_seconds * 1000)),
+          ]);
+          anyFinished = winner;
+        } else {
+          await Promise.race(running.map(id => waitForTask(tasks.get(id)!)));
+          anyFinished = true;
+        }
       }
 
       const results = taskIds.map(id => {
         const t = tasks.get(id);
         if (!t) return { taskId: id, error: "not found" };
         const broName = findBroNameForTask(id);
-        const r = taskResult(t);
-        if (broName) r.bro = broName;
-        return r;
+        if (t.status !== "running") {
+          const r = taskResult(t);
+          if (broName) r.bro = broName;
+          return r;
+        }
+        return timeoutSnapshot(t);
       });
-      return json({ results });
+      return json({ any_completed: anyFinished, results });
     }
 
     case "brofile": {
