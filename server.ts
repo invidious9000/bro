@@ -78,13 +78,18 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       // Claude sessionId is pre-assigned at exec time
     },
     supportsResume: true,
+    models: [
+      { id: "claude-opus-4-6", description: "Frontier model, 1M context", default: true },
+      { id: "claude-sonnet-4-6", description: "Fast + capable, balanced cost" },
+      { id: "claude-haiku-4-5-20251001", description: "Fastest, lowest cost" },
+    ],
   },
   codex: {
     bin: process.env.CODEX_BIN || "codex",
     buildExecArgs(prompt, _sessionId, cwd, opts) {
       const args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--json"];
       if (opts?.model) args.push("--model", opts.model);
-      if (opts?.effort) args.push("--reasoning-effort", opts.effort);
+      if (opts?.effort) args.push("-c", `model_reasoning_effort="${opts.effort}"`);
       if (cwd) args.push("-C", cwd);
       args.push(prompt);
       return args;
@@ -95,7 +100,7 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
         "--dangerously-bypass-approvals-and-sandbox", "--json",
       ];
       if (opts?.model) args.push("--model", opts.model);
-      if (opts?.effort) args.push("--reasoning-effort", opts.effort);
+      if (opts?.effort) args.push("-c", `model_reasoning_effort="${opts.effort}"`);
       args.push(sessionId, prompt);
       return args;
     },
@@ -120,6 +125,23 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       }
     },
     supportsResume: true,
+    models: [
+      { id: "gpt-5.4", description: "Latest frontier agentic coding model", default: true },
+      { id: "gpt-5.4-mini", description: "Smaller frontier agentic coding model" },
+      { id: "gpt-5.3-codex", description: "Frontier Codex-optimized agentic coding model" },
+      { id: "gpt-5.3-codex-spark", description: "Ultra-fast coding model" },
+      { id: "gpt-5.2-codex", description: "Frontier agentic coding model" },
+      { id: "gpt-5.2", description: "Optimized for professional work and long-running agents" },
+      { id: "gpt-5.1-codex-max", description: "Deep and fast reasoning, xhigh effort" },
+      { id: "gpt-5.1-codex-mini", description: "Cheaper, faster, less capable" },
+    ],
+    efforts: [
+      { id: "minimal", description: "Fastest, fewest reasoning tokens" },
+      { id: "low", description: "Light reasoning" },
+      { id: "medium", description: "Balanced speed and depth", default: true },
+      { id: "high", description: "Greater depth for complex problems" },
+      { id: "xhigh", description: "Maximum depth (gpt-5.1-codex-max / gpt-5.2-codex only)" },
+    ],
   },
   copilot: {
     bin: process.env.COPILOT_BIN || "gh",
@@ -179,6 +201,20 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       }
     },
     supportsResume: true,
+    models: [
+      { id: "claude-opus-4-6", description: "Anthropic Opus 4.6" },
+      { id: "claude-sonnet-4-6", description: "Anthropic Sonnet 4.6" },
+      { id: "gpt-5.3-codex", description: "OpenAI Codex-optimized" },
+      { id: "gpt-5.2-codex", description: "OpenAI Codex" },
+      { id: "gpt-5.1-codex-max", description: "OpenAI deep reasoning" },
+      { id: "gpt-5.2", description: "OpenAI general purpose" },
+    ],
+    efforts: [
+      { id: "low", description: "Fast responses with lighter reasoning" },
+      { id: "medium", description: "Balanced speed and depth", default: true },
+      { id: "high", description: "Greater depth for complex problems" },
+      { id: "xhigh", description: "Maximum reasoning depth" },
+    ],
   },
   vibe: {
     bin: process.env.VIBE_BIN || "vibe",
@@ -209,6 +245,10 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
       // Vibe session discovery is post-hoc — handled in close handler
     },
     supportsResume: true,
+    models: [
+      { id: "devstral-2", description: "Devstral 2 123B, flagship coding model", default: true },
+      { id: "devstral-small", description: "Devstral Small 2 24B, fast and compact" },
+    ],
   },
   gemini: {
     bin: process.env.GEMINI_BIN || "gemini",
@@ -250,12 +290,32 @@ const PROVIDERS: Record<Provider, ProviderConfig> = {
     },
     extractSessionId() {},
     supportsResume: true,
+    models: [
+      { id: "gemini-2.5-flash", description: "Fast and capable", default: true },
+      { id: "gemini-2.5-flash-lite", description: "Lightweight, lowest cost" },
+      { id: "gemini-2.5-pro", description: "Most capable Gemini 2.5" },
+      { id: "gemini-3-flash-preview", description: "Next-gen flash preview" },
+      { id: "gemini-3.1-flash-lite-preview", description: "Next-gen lite preview" },
+      { id: "gemini-3.1-pro-preview", description: "Next-gen pro preview" },
+    ],
   },
 };
 
 interface BroExecOpts {
   model?: string;
   effort?: string;
+}
+
+interface ModelInfo {
+  id: string;
+  description?: string;
+  default?: boolean;
+}
+
+interface EffortInfo {
+  id: string;
+  description?: string;
+  default?: boolean;
 }
 
 interface ProviderConfig {
@@ -265,6 +325,8 @@ interface ProviderConfig {
   parseEvent(evt: Record<string, unknown>, task: Task): void;
   extractSessionId(evt: Record<string, unknown>, task: Task): void;
   supportsResume: boolean;
+  models?: ModelInfo[];
+  efforts?: EffortInfo[];
 }
 
 // ---------------------------------------------------------------------------
@@ -877,6 +939,63 @@ function timeoutSnapshot(task: Task): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Progress notifications — human-facing observability during blocking waits
+// ---------------------------------------------------------------------------
+
+const PROGRESS_INTERVAL_MS = 15_000;
+
+function taskActivityLine(task: Task): string {
+  const broName = findBroNameForTask(task.id);
+  const label = broName ? `${broName}/${task.provider}` : `${task.id.slice(0, 8)}/${task.provider}`;
+  const el = elapsed(task);
+  const evts = task.events.length;
+
+  let activity = "";
+  if (task.status !== "running") {
+    activity = task.status;
+  } else if (task.lastAssistantMessage) {
+    const msg = task.lastAssistantMessage.replace(/\n/g, " ").trim();
+    activity = msg.length > 80 ? msg.slice(0, 80) + "…" : msg;
+  } else if (evts === 0) {
+    activity = "starting…";
+  } else {
+    activity = "working…";
+  }
+
+  return `[${label}] ${el} | ${evts} events | ${activity}`;
+}
+
+/** Start emitting progress notifications for a set of tasks. Returns a stop function. */
+function startProgressEmitter(
+  srv: Server,
+  progressToken: string | number,
+  taskIds: string[],
+): () => void {
+  let tick = 0;
+  const interval = setInterval(async () => {
+    tick++;
+    const lines = taskIds
+      .map(id => tasks.get(id))
+      .filter((t): t is Task => t != null && t.status === "running")
+      .map(taskActivityLine);
+    if (lines.length === 0) return;
+    try {
+      await srv.notification({
+        method: "notifications/progress",
+        params: {
+          progressToken,
+          progress: tick,
+          message: lines.join("\n"),
+        },
+      });
+    } catch {
+      // Client may have disconnected — swallow
+    }
+  }, PROGRESS_INTERVAL_MS);
+  return () => clearInterval(interval);
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1363,17 +1482,29 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         try { broMatch = findBroInstance(broName); } catch (e: unknown) {
           return err((e as Error).message);
         }
-        if (!broMatch) return err(`Unknown bro: ${broName}`);
-        const brofile = resolveBrofile(broMatch.member.brofile, broMatch.team.projectDir);
-        if (!brofile) return err(`Brofile not found: ${broMatch.member.brofile}`);
-        provider = brofile.provider;
-        lens = brofile.lens;
-        if (brofile.model || brofile.effort) execOpts = { model: brofile.model, effort: brofile.effort };
-        if (brofile.account) {
-          const acct = loadAccount(brofile.account);
-          if (acct?.env) envOverrides = acct.env;
+        if (broMatch) {
+          const brofile = resolveBrofile(broMatch.member.brofile, broMatch.team.projectDir);
+          if (!brofile) return err(`Brofile not found: ${broMatch.member.brofile}`);
+          provider = brofile.provider;
+          lens = brofile.lens;
+          if (brofile.model || brofile.effort) execOpts = { model: brofile.model, effort: brofile.effort };
+          if (brofile.account) {
+            const acct = loadAccount(brofile.account);
+            if (acct?.env) envOverrides = acct.env;
+          }
+          if (!cwd) cwd = broMatch.team.projectDir;
+        } else {
+          // No team member found — try resolving as a standalone brofile
+          const brofile = resolveBrofile(broName, project_dir);
+          if (!brofile) return err(`Unknown bro or brofile: ${broName}`);
+          provider = brofile.provider;
+          lens = brofile.lens;
+          if (brofile.model || brofile.effort) execOpts = { model: brofile.model, effort: brofile.effort };
+          if (brofile.account) {
+            const acct = loadAccount(brofile.account);
+            if (acct?.env) envOverrides = acct.env;
+          }
         }
-        if (!cwd) cwd = broMatch.team.projectDir;
       } else if (rawProvider) {
         provider = rawProvider;
       } else {
@@ -1422,7 +1553,12 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         try { broMatch = findBroInstance(broName); } catch (e: unknown) {
           return err((e as Error).message);
         }
-        if (!broMatch) return err(`Unknown bro: ${broName}`);
+        if (!broMatch) {
+          // Standalone brofile can't be resumed — no session to continue
+          const brofile = resolveBrofile(broName, project_dir);
+          if (brofile) return err(`Brofile "${broName}" is not in a team and has no session — use exec first, or provide session_id + provider`);
+          return err(`Unknown bro: ${broName}`);
+        }
         if (!broMatch.member.sessionId || broMatch.member.sessionId === "pending") {
           return err(`Bro "${broName}" has no active session — use exec first`);
         }
@@ -1467,9 +1603,17 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { task_id, timeout_seconds } = args as { task_id: string; timeout_seconds?: number };
       const task = tasks.get(task_id);
       if (!task) return err(`Unknown task ID: ${task_id}`);
-      const completed = await waitForTaskWithTimeout(task, timeout_seconds);
-      if (completed) return json(taskResult(task));
-      return json(timeoutSnapshot(task));
+      const progressToken = request.params._meta?.progressToken;
+      const stopProgress = (progressToken != null && task.status === "running")
+        ? startProgressEmitter(srv, progressToken, [task_id])
+        : undefined;
+      try {
+        const completed = await waitForTaskWithTimeout(task, timeout_seconds);
+        if (completed) return json(taskResult(task));
+        return json(timeoutSnapshot(task));
+      } finally {
+        stopProgress?.();
+      }
     }
 
     case "status": {
@@ -1480,7 +1624,10 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "providers": {
-      const info: Record<string, { bin: string; found: boolean; supportsResume: boolean }> = {};
+      const info: Record<string, {
+        bin: string; found: boolean; supportsResume: boolean;
+        models?: ModelInfo[]; efforts?: EffortInfo[];
+      }> = {};
       for (const [name, config] of Object.entries(PROVIDERS)) {
         let found = false;
         try {
@@ -1494,7 +1641,11 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
           });
           found = r.status === 0;
         } catch {}
-        info[name] = { bin: config.bin, found, supportsResume: config.supportsResume };
+        info[name] = {
+          bin: config.bin, found, supportsResume: config.supportsResume,
+          ...(config.models && { models: config.models }),
+          ...(config.efforts && { efforts: config.efforts }),
+        };
       }
       return json(info);
     }
@@ -1611,25 +1762,32 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         return err("Provide either team or task_ids");
       }
 
-      const completions = await Promise.all(taskIds.map(id => {
-        const t = tasks.get(id);
-        return t ? waitForTaskWithTimeout(t, timeout_seconds) : Promise.resolve(true);
-      }));
+      const progressToken = request.params._meta?.progressToken;
+      const stopProgress = (progressToken != null)
+        ? startProgressEmitter(srv, progressToken, taskIds)
+        : undefined;
+      try {
+        const completions = await Promise.all(taskIds.map(id => {
+          const t = tasks.get(id);
+          return t ? waitForTaskWithTimeout(t, timeout_seconds) : Promise.resolve(true);
+        }));
 
-      const results = taskIds.map((id, i) => {
-        const t = tasks.get(id);
-        if (!t) return { taskId: id, error: "not found" };
-        const broName = findBroNameForTask(id);
-        // Completed or no timeout — return full result; otherwise snapshot
-        if (completions[i]) {
-          const r = taskResult(t);
-          if (broName) r.bro = broName;
-          return r;
-        }
-        return timeoutSnapshot(t);
-      });
-      const allDone = completions.every(Boolean);
-      return json({ all_completed: allDone, results });
+        const results = taskIds.map((id, i) => {
+          const t = tasks.get(id);
+          if (!t) return { taskId: id, error: "not found" };
+          const broName = findBroNameForTask(id);
+          if (completions[i]) {
+            const r = taskResult(t);
+            if (broName) r.bro = broName;
+            return r;
+          }
+          return timeoutSnapshot(t);
+        });
+        const allDone = completions.every(Boolean);
+        return json({ all_completed: allDone, results });
+      } finally {
+        stopProgress?.();
+      }
     }
 
     case "when_any": {
@@ -1658,33 +1816,40 @@ srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         const t = tasks.get(id);
         return t && t.status === "running";
       });
-      let anyFinished = running.length < taskIds.length; // Some already done
-      if (!anyFinished && running.length > 0) {
-        if (timeout_seconds != null) {
-          // Race all running tasks against the timeout
-          const winner = await Promise.race([
-            ...running.map(id => waitForTaskWithTimeout(tasks.get(id)!, undefined).then(() => true)),
-            new Promise<false>(resolve => setTimeout(() => resolve(false), timeout_seconds * 1000)),
-          ]);
-          anyFinished = winner;
-        } else {
-          await Promise.race(running.map(id => waitForTask(tasks.get(id)!)));
-          anyFinished = true;
+      const progressToken = request.params._meta?.progressToken;
+      const stopProgress = (progressToken != null && running.length > 0)
+        ? startProgressEmitter(srv, progressToken, taskIds)
+        : undefined;
+      try {
+        let anyFinished = running.length < taskIds.length; // Some already done
+        if (!anyFinished && running.length > 0) {
+          if (timeout_seconds != null) {
+            const winner = await Promise.race([
+              ...running.map(id => waitForTaskWithTimeout(tasks.get(id)!, undefined).then(() => true)),
+              new Promise<false>(resolve => setTimeout(() => resolve(false), timeout_seconds * 1000)),
+            ]);
+            anyFinished = winner;
+          } else {
+            await Promise.race(running.map(id => waitForTask(tasks.get(id)!)));
+            anyFinished = true;
+          }
         }
-      }
 
-      const results = taskIds.map(id => {
-        const t = tasks.get(id);
-        if (!t) return { taskId: id, error: "not found" };
-        const broName = findBroNameForTask(id);
-        if (t.status !== "running") {
-          const r = taskResult(t);
-          if (broName) r.bro = broName;
-          return r;
-        }
-        return timeoutSnapshot(t);
-      });
-      return json({ any_completed: anyFinished, results });
+        const results = taskIds.map(id => {
+          const t = tasks.get(id);
+          if (!t) return { taskId: id, error: "not found" };
+          const broName = findBroNameForTask(id);
+          if (t.status !== "running") {
+            const r = taskResult(t);
+            if (broName) r.bro = broName;
+            return r;
+          }
+          return timeoutSnapshot(t);
+        });
+        return json({ any_completed: anyFinished, results });
+      } finally {
+        stopProgress?.();
+      }
     }
 
     case "brofile": {
